@@ -1,0 +1,70 @@
+# Single source of truth for the experiment matrix.
+# serve/launch.py reads `model`, `topologies`, and `profiles`.
+# scripts/run_matrix.sh reads `sweeps` (via bench/loadgen.py --sweep).
+
+model:
+  model_id: gpt-oss-120b                 # name clients send in "model"
+  # Point this at local NVMe (see setup/install.sh) so replica restarts don't
+  # re-download ~65 GB. Falls back to the HF id if the path doesn't exist.
+  model_source: /opt/dlami/nvme/models/gpt-oss-120b
+  hf_id: openai/gpt-oss-120b
+  accelerator_type: H100                 # P5 = H100 80GB; p5e/p5en = H200
+
+# name -> (tensor_parallel_size, num_replicas)
+# "iso-4" is the comparison you asked for (same 4 GPUs, split differently).
+# "iso-8" uses the whole P5 and is optional (run_matrix.sh GPU_BUDGET=8).
+topologies:
+  tp1x4: {tp: 1, replicas: 4, budget: 4}
+  tp2x2: {tp: 2, replicas: 2, budget: 4}
+  tp4x1: {tp: 4, replicas: 1, budget: 4}
+  tp1x8: {tp: 1, replicas: 8, budget: 8}
+  tp2x4: {tp: 2, replicas: 4, budget: 8}
+  tp4x2: {tp: 4, replicas: 2, budget: 8}
+  tp8x1: {tp: 8, replicas: 1, budget: 8}
+
+# vLLM engine configs, one tuned per phase. Everything here is passed through
+# to vLLM as engine_kwargs, so any vLLM engine arg is fair game.
+# Prefix caching is OFF in both: the 15K prompts must be computed every time,
+# otherwise repeat runs measure cache hits, not prefill.
+profiles:
+  prefill:
+    # A 15K prompt fits in ~1 scheduler step: minimises TTFT, maximises
+    # prefill tok/s. Low max_num_seqs because prefill is compute-bound.
+    max_model_len: 32768
+    max_num_batched_tokens: 16384
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.92
+    enable_prefix_caching: false
+    async_scheduling: true
+  decode:
+    # Smaller chunks so admitting a new 15K prompt stalls running decodes for
+    # less time; large max_num_seqs + big CUDA-graph range for wide batches.
+    max_model_len: 32768
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    gpu_memory_utilization: 0.92
+    enable_prefix_caching: false
+    async_scheduling: true
+    compilation_config:
+      max_cudagraph_capture_size: 512
+    # NOTE: do NOT set stream_interval > 1 here (the vLLM Hopper recipe uses 20).
+    # It batches streamed tokens and makes client-side ITL meaningless.
+
+# Extra env for every replica. On H100 the MXFP4 MoE runs on Marlin
+# (weights MXFP4, activations BF16). The MXFP4 x MXFP8 FlashInfer path
+# (VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1) is Blackwell-only (SM100) - see docs/PLAN.md.
+env_vars: {}
+
+sweeps:
+  prefill:
+    input_len: 15000
+    output_len: 1
+    concurrency: [1, 2, 4, 8, 16, 32]
+    requests_per_level: 4x        # 4x concurrency, min 16
+  decode:
+    input_len: 15000
+    # Must outlast the prefill backlog of a burst, or the pure-decode window
+    # never opens (see docs/PLAN.md, 'decode window').
+    output_len: 2048
+    concurrency: [1, 4, 8, 16, 32, 64, 128]
+    bursts_per_level: 2

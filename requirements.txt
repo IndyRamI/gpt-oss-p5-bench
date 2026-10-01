@@ -1,0 +1,5 @@
+# Client/analysis side only. On the P5, setup/install.sh also installs ray[serve,llm] (+ pinned vLLM).
+aiohttp
+pyyaml
+matplotlib
+transformers
